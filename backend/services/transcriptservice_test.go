@@ -1,11 +1,20 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"arguehub/models"
+	"google.golang.org/genai"
 )
 
 const validJudgeResult = `{
@@ -33,6 +42,158 @@ const validJudgeResult = `{
     "opponent_analysis": "The Against side should answer the key impact comparison."
   }
 }`
+
+func TestJudgeDebateHumanVsHumanReportsFailures(t *testing.T) {
+	originalClient := geminiClient
+	t.Cleanup(func() { geminiClient = originalClient })
+
+	for _, test := range []struct {
+		name       string
+		statusCode int
+		response   string
+		wantError  string
+		wantCalls  int32
+	}{
+		{"quota exceeded", http.StatusTooManyRequests, `{"error":{"code":429,"message":"Judge quota exhausted","status":"RESOURCE_EXHAUSTED"}}`, "RESOURCE_EXHAUSTED", 1},
+		{"model unavailable", http.StatusNotFound, `{"error":{"code":404,"message":"Model unavailable","status":"NOT_FOUND"}}`, "NOT_FOUND", 1},
+		{"permission denied", http.StatusForbidden, `{"error":{"code":403,"message":"API access denied","status":"PERMISSION_DENIED"}}`, "PERMISSION_DENIED", 1},
+		{"service unavailable", http.StatusServiceUnavailable, `{"error":{"code":503,"message":"This model is currently experiencing high demand","status":"UNAVAILABLE"}}`, "UNAVAILABLE", 3},
+		{"empty response", http.StatusOK, `{"candidates":[]}`, "empty judgment", 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(test.statusCode)
+				fmt.Fprint(w, test.response)
+			}))
+			defer server.Close()
+			var err error
+			geminiClient, err = genai.NewClient(context.Background(), &genai.ClientConfig{
+				APIKey: "test-key", Backend: genai.BackendGeminiAPI,
+				HTTPOptions: genai.HTTPOptions{BaseURL: server.URL},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := JudgeDebateHumanVsHuman(map[string]string{
+				"openingFor": "Alex: Support the motion.", "openingAgainst": "Sam: Oppose the motion.",
+			})
+			if result != "" || err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("judging = (%q, %v), want empty result and error containing %q", result, err, test.wantError)
+			}
+			if got := requests.Load(); got != test.wantCalls {
+				t.Errorf("Gemini requests = %d, want %d", got, test.wantCalls)
+			}
+		})
+	}
+}
+
+func TestJudgeDebateHumanVsHumanSendsAllRounds(t *testing.T) {
+	originalClient := geminiClient
+	t.Cleanup(func() { geminiClient = originalClient })
+	transcripts := map[string]string{
+		"topic": "The debate motion", "team_context": "Format: 2-vs-2 team debate.",
+		"openingFor": "Alex: Opening argument.", "openingAgainst": "Sam: Opening rebuttal.",
+		"crossForQuestion": "Alex: First question?", "crossAgainstAnswer": "Sam: First answer.",
+		"crossAgainstQuestion": "Sam: Second question?", "crossForAnswer": "Alex: Second answer.",
+		"closingFor": "Alex: Final argument.", "closingAgainst": "Sam: Final rebuttal.",
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/models/"+defaultGeminiModel+":generateContent") {
+			t.Errorf("unexpected Gemini request: %s %s", r.Method, r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		for phase, text := range transcripts {
+			if !strings.Contains(string(body), text) {
+				t.Errorf("Gemini request is missing %s transcript or context", phase)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"error":{"code":503,"message":"Temporary high demand","status":"UNAVAILABLE"}}`)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"candidates": []interface{}{map[string]interface{}{
+				"content": map[string]interface{}{
+					"parts": []interface{}{map[string]string{"text": "Here is the judgment: " + validJudgeResult}},
+				},
+				"finishReason": "STOP",
+			}},
+		})
+	}))
+	defer server.Close()
+	var err error
+	geminiClient, err = genai.NewClient(context.Background(), &genai.ClientConfig{
+		APIKey: "test-key", Backend: genai.BackendGeminiAPI,
+		HTTPOptions: genai.HTTPOptions{BaseURL: server.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := JudgeDebateHumanVsHuman(transcripts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := normalizeJudgeResult(result); err != nil {
+		t.Fatalf("successful Gemini judgment failed normalization: %v", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Errorf("Gemini requests = %d, want 2 after transient 503", got)
+	}
+}
+
+func TestGenerateJudgeModelTextStopsAtDeadline(t *testing.T) {
+	originalClient := geminiClient
+	t.Cleanup(func() { geminiClient = originalClient })
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"error":{"code":503,"message":"Temporary high demand","status":"UNAVAILABLE"}}`)
+	}))
+	defer server.Close()
+	var err error
+	geminiClient, err = genai.NewClient(context.Background(), &genai.ClientConfig{
+		APIKey: "test-key", Backend: genai.BackendGeminiAPI,
+		HTTPOptions: genai.HTTPOptions{BaseURL: server.URL},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, err := generateJudgeModelText(ctx, "Test judgment"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("judging error = %v, want deadline exceeded", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("Gemini requests = %d, want 1 before deadline expires during backoff", got)
+	}
+}
+
+func TestJudgeDebateHumanVsHumanPreconditions(t *testing.T) {
+	originalClient := geminiClient
+	t.Cleanup(func() { geminiClient = originalClient })
+	geminiClient = nil
+	if result, err := JudgeDebateHumanVsHuman(nil); result != "" || err == nil || !strings.Contains(err.Error(), "not initialized") {
+		t.Fatalf("uninitialized judge = (%q, %v), want initialization error", result, err)
+	}
+	geminiClient = &genai.Client{}
+	for _, phase := range []string{"openingFor", "openingAgainst"} {
+		result, err := JudgeDebateHumanVsHuman(map[string]string{phase: "One side spoke."})
+		if result != "" || err == nil || !strings.Contains(err.Error(), "both sides") {
+			t.Fatalf("one-sided debate = (%q, %v), want missing transcript error", result, err)
+		}
+	}
+}
 
 func TestNormalizeJudgeResult(t *testing.T) {
 	normalized, err := normalizeJudgeResult("```json\n" + validJudgeResult + "\n```")

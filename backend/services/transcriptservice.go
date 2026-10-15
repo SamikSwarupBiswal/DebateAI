@@ -185,7 +185,10 @@ func SubmitTranscripts(
 			merged["team_context"] = teamContext
 		}
 
-		result := JudgeDebateHumanVsHuman(merged)
+		result, err := JudgeDebateHumanVsHuman(merged)
+		if err != nil {
+			return nil, fmt.Errorf("AI judge failed: %w", err)
+		}
 		result, err = normalizeJudgeResult(result)
 		if err != nil {
 			return nil, fmt.Errorf("AI judge returned an invalid judgment: %w", err)
@@ -841,9 +844,10 @@ func lookupRoomTopic(ctx context.Context, roomID string) string {
 	return ""
 }
 
-func JudgeDebateHumanVsHuman(merged map[string]string) string {
+// JudgeDebateHumanVsHuman evaluates both sides and preserves failures for the caller.
+func JudgeDebateHumanVsHuman(merged map[string]string) (string, error) {
 	if geminiClient == nil {
-		return "Unable to judge."
+		return "", errors.New("Gemini client is not initialized; configure GEMINI_API_KEY")
 	}
 
 	var transcript strings.Builder
@@ -868,7 +872,7 @@ func JudgeDebateHumanVsHuman(merged map[string]string) string {
 		}
 	}
 	if !hasForResponse || !hasAgainstResponse {
-		return "Unable to judge: both sides must have at least one transcribed response."
+		return "", errors.New("both sides must have at least one transcribed response")
 	}
 
 	topic := strings.TrimSpace(merged["topic"])
@@ -937,14 +941,14 @@ Provide integer scores from 0 to 10 for each section, totals equal to the sum of
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	text, err := generateDefaultModelText(ctx, prompt)
+	text, err := generateJudgeModelText(ctx, prompt)
 	if err != nil {
-		return "Unable to judge."
+		return "", fmt.Errorf("Gemini judgment request failed (model %s): %w", defaultGeminiModel, err)
 	}
 	if text == "" {
-		return "Unable to judge."
+		return "", errors.New("Gemini returned an empty judgment")
 	}
-	return text
+	return text, nil
 }
 
 // extractJSONObject returns the substring from the first "{" to the last "}"

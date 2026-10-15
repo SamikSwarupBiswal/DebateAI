@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 
 	"arguehub/config"
 	"arguehub/services"
@@ -30,7 +31,10 @@ func main() {
 		"closingAgainst":       "In closing, the proposal ignores key risks. The safer choice is to reject it.",
 	}
 
-	result := services.JudgeDebateHumanVsHuman(sample)
+	result, err := services.JudgeDebateHumanVsHuman(sample)
+	if err != nil {
+		log.Fatalf("Judgment failed: %v", err)
+	}
 	fmt.Println("Judgment Result:")
 	fmt.Println(result)
 }

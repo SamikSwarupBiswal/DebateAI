@@ -3,7 +3,9 @@ package services
 import (
 	"context"
 	"errors"
+	"net/http"
 	"strings"
+	"time"
 
 	"google.golang.org/genai"
 )
@@ -50,4 +52,26 @@ func cleanModelOutput(text string) string {
 
 func generateDefaultModelText(ctx context.Context, prompt string) (string, error) {
 	return generateModelText(ctx, defaultGeminiModel, prompt)
+}
+
+// generateJudgeModelText retries transient overload without extending the caller's deadline.
+func generateJudgeModelText(ctx context.Context, prompt string) (string, error) {
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		text, err := generateDefaultModelText(ctx, prompt)
+		var apiError genai.APIError
+		if err == nil || attempt >= 2 || !errors.As(err, &apiError) || apiError.Code != http.StatusServiceUnavailable {
+			return text, err
+		}
+
+		timer := time.NewTimer(time.Second << attempt)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
